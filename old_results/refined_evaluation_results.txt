@@ -1,0 +1,62 @@
+(grid_SR) PS C:\Users\upraj\Prajwal\GSOC\DeepLense\Grid_Based_Experiment> python superres/evaluate.py --fits superres/results/fits_refined_mu.json --root .
+==============================================================================
+EVALUATION  superres/results/fits_refined_mu.json
+  target = image   psf = empirical   supersample = 1   n = 800
+==============================================================================
+
+1. PARAMETER RECOVERY  (nothing below was available to the fit)
+
+   parameter      fit med  true med  med |err|  p90 |err|  Spearman
+   theta_E          1.370     1.320      0.047      0.179    +0.960
+   beta             0.292     0.305      0.033      0.091    +0.915
+   R_sersic         0.505     0.484      0.041      0.159    +0.954
+   n_sersic         1.140     1.005      0.138      0.786    +0.945
+   gamma            2.003     2.058      0.078      0.247    +0.538
+   e                0.200     0.222      0.032      0.098    +0.839
+   g                0.049     0.032      0.015      0.050    +0.650
+
+   All seven are recovered from the image alone -- nothing above was
+   available to the fit.
+   NOTE ON TARGET: fit `image` (the real observation), not `image_nss`.
+   The _nss arrays were rendered with a CIRCULAR lens and are inconsistent
+   with `image`/`kappa` (audit_dataset.py). Fitting image_nss therefore
+   returns |e| ~ 0.03 with Spearman ~ 0; fitting `image` returns |e| ~ 0.20
+   with Spearman ~ +0.78, matching the manifest.
+
+2. SOURCE PLANE vs the npz `unlensed` array
+
+   corr                 median    0.9873   p10   0.9315   p90   0.9976
+   size_ratio           median    1.0808   p10   0.9694   p90   1.2621
+   centroid_err_px      median    0.5061   p10   0.1542   p90   1.1615
+   peak_ratio           median    0.8340   p10   0.6035   p90   1.0276
+   nmse                 median    0.0252   p10   0.0047   p90   0.1311
+
+   size_ratio -> 1 is the target. The SIS pipeline sat at 10.6-12.8
+   across a 100x sweep of the TV weight (tv = 0, 0.03, 0.1, 0.3, 3.0).
+   The model source is convolved with the PSF before comparison, which
+   evaluate_sis.py did not do -- `unlensed` is post-PSF.
+
+3. GOODNESS OF FIT
+
+   chi2/dof   median 3227.9   p10 249.1   p90 16632.3
+   null baselines (median chi2/dof): constant 37511   blur2 2796   blur3 4091
+
+   chi2/dof does not reach 1 and the reason is measured, not guessed:
+   calibrate_psf.py extracts the PSF empirically and finds Moffat-like
+   wings -- at r = 0.25 arcsec the true kernel is 0.139 of its peak
+   against 0.005 for a 0.18 arcsec Gaussian. Model_A arcs reach
+   peak/sigma_bg of 10^3-10^4, so a 1% kernel-shape error is a ~50 sigma
+   per-pixel residual. The PSF SHAPE, not the parameters, is the floor.
+
+4. STRATIFIED BY snr_max
+
+  chi2_per_dof stratified by snr_max
+           0-6  n=158   median 1320.6503   p25  251.5543   p75 3826.8057
+          6-15  n=424   median 2706.2352   p25 1041.8352   p75 6447.0416
+           >15  n=218   median 7139.7346   p25 3099.0790   p75 17272.2707
+           ALL  n=800   median 3227.8510
+  _size_ratio stratified by snr_max
+           0-6  n=158   median    1.0504   p25    0.9927   p75    1.1354
+          6-15  n=424   median    1.0757   p25    1.0308   p75    1.1472
+           >15  n=218   median    1.1190   p25    1.0413   p75    1.2204
+           ALL  n=800   median    1.0808

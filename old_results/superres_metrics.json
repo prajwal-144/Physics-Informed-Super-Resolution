@@ -1,0 +1,51 @@
+{
+ "config": {
+  "root": ".",
+  "split": "train",
+  "classes": [
+   "axion",
+   "cdm",
+   "wdm"
+  ],
+  "n": 10000,
+  "pixel_scale": 0.10593,
+  "psf_fwhm": 0.2,
+  "psf_mode": "empirical",
+  "psf_beta": 2.5,
+  "psf_path": "sie_pipeline/results/psf_empirical.npy",
+  "supersample": 1,
+  "fit_radius_px": 45.0,
+  "target": "image",
+  "out": "superres/results/fits_train.json",
+  "verbose": false
+ },
+ "fits": "superres/results/fits_train.json",
+ "n": 10000,
+ "by_factor": {
+  "1": {
+   "corr": 0.9783651938160677,
+   "nmse": 0.0425732472774455,
+   "size_ratio": 0.974903828409661
+  },
+  "2": {
+   "corr": 0.9774342534312634,
+   "nmse": 0.044534588085843735,
+   "size_ratio": 0.9533128765048418
+  },
+  "4": {
+   "corr": 0.9771888446023013,
+   "nmse": 0.045146241123749105,
+   "size_ratio": 0.9395179108734664
+  },
+  "8": {
+   "corr": 0.9770148078152734,
+   "nmse": 0.04530077646686205,
+   "size_ratio": 0.9313038077661807
+  }
+ },
+ "mu_ring_median": 6.825023213421199,
+ "check_1x_vs_stored_unlensed": {
+  "corr": 0.9863368632788594,
+  "size_ratio": 1.0901358466017765
+ }
+}
