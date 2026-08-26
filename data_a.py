@@ -202,26 +202,38 @@ class ModelADataset:
         swallow into a single filename component. Rows without both keys are
         skipped and counted.
 
+        A row whose `index` lies past the end of THIS dataset is skipped rather
+        than reported as a mismatch. `limit=` truncates a prefix of the same
+        ordering, so a fits JSON written over the full 2000-image val split is
+        legitimately re-used by a 60-image run: its first 60 rows are exactly
+        the rows that run addresses, and rows 60+ are never read. Skipping them
+        costs no safety, because a JSON carrying the OLD ordering still
+        mismatches inside the checked prefix (index 1 is cdm under the
+        round-robin and axion under the old concatenated sort), and because a
+        dataset built with filters rather than a plain truncation mismatches on
+        path for the same reason. If NO row falls inside the dataset, nothing
+        was verified and that does raise.
+
         Returns the number of rows actually checked.
         """
         def tail(p) -> tuple:
             parts = [q for q in str(p).replace("\\", "/").split("/") if q]
             return tuple(parts[-2:])
 
-        checked, bad = 0, []
+        checked, outside, bad = 0, 0, []
         for r in (rows.values() if isinstance(rows, dict) else rows):
             i, p = r.get("index"), r.get("path")
             if i is None or p is None:
                 continue
-            checked += 1
             if not (0 <= int(i) < len(self.paths)):
-                bad.append((i, p, "<index out of range>"))
+                outside += 1
                 continue
+            checked += 1
             have = self.paths[int(i)]
             if tail(p) != tail(have):
                 bad.append((i, str(p), str(have)))
-            if len(bad) >= 5:
-                break
+                if len(bad) >= 5:
+                    break
         if bad:
             lines = "\n".join(f"    index {i}: json says {w}, dataset has {h}"
                               for i, w, h in bad)
@@ -231,6 +243,13 @@ class ModelADataset:
                 "  The JSON was written under a different dataset ordering. Re-run\n"
                 "  the step that produced it rather than re-scoring it, or the\n"
                 "  numbers will be silently wrong. See ModelADataset's docstring.")
+        if checked == 0:
+            raise RuntimeError(
+                f"{what}: none of the {outside} rows carries an index inside this\n"
+                f"  dataset (len={len(self.paths)}), so nothing was verified and\n"
+                "  nothing may be scored against it. Either the JSON was written for\n"
+                "  a different split/class list, or this dataset was built with\n"
+                "  filters that removed every image the JSON refers to.")
         return checked
 
     # ---- pixel data ------------------------------------------------------
