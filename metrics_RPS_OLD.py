@@ -22,16 +22,12 @@ induces inflates it for free.
 
 WHAT REPLACES IT
 ----------------
-    chi2_per_dof   the standard goodness of fit. The background rms comes from
-                   the annulus of each image (data_a.ModelADataset.sigma) and the
-                   PHOTON term from noise_model.POISSON_GAIN, because Model_A was
-                   generated with var = sigma_bg^2 + flux/t and not with
-                   sigma_bg^2 alone; dof = n_fitted_pixels - n_free_parameters.
-                   A correct model on a correct noise model gives 1.0. Unlike
-                   `skill` this has an absolute meaning -- but only once the
-                   variance is right, which until noise_model.py it was not:
-                   on the background-only convention a pure-noise residual
-                   scores a median chi2/dof near 1,800.
+    chi2_per_dof   the standard goodness of fit. sigma is measured from the
+                   background annulus of each image (data_a.ModelADataset.sigma);
+                   dof = n_fitted_pixels - n_free_parameters. A correct model on
+                   correctly estimated noise gives 1.0. Unlike `skill` this has
+                   an absolute meaning, so "did it fit" stops being relative to
+                   an arbitrary baseline.
 
     source_truth   the model source, CONVOLVED WITH THE PSF, against the npz
                    `unlensed` array. evaluate_sis.py compared the intrinsic
@@ -71,53 +67,20 @@ EPS = 1e-12
 # ---------------------------------------------------------------------------
 
 def chi2_per_dof(pred: np.ndarray, data: np.ndarray, sigma: float,
-                 mask: Optional[np.ndarray] = None, n_params: int = 0,
-                 gain: float = 0.0, frac: float = 0.0) -> float:
-    """sum((pred - data)^2 / var) / (n_pixels - n_params), with
+                 mask: Optional[np.ndarray] = None, n_params: int = 0) -> float:
+    """sum(((pred - data)/sigma)^2) / (n_pixels - n_params).
 
-        var = sigma^2  +  gain * max(pred, 0)  +  (frac * max(pred, 0))^2
-
-    sigma is the background rms, a scalar per image, from the r > 50 px annulus
-    (data_a.ModelADataset.sigma). The arcs sit at r < 30 px on a 127 px grid so
-    that annulus is source-free.
-
-    `gain` IS THE PHOTON NOISE, AND IT IS NOT AN OPTIONAL REFINEMENT. Model_A was
-    generated with var = sigma_bg^2 + flux / t; noise_model.py measures the
-    coefficient two independent ways at gain ~= 0.8 in native units. With
-    gain = 0 this function understates the variance on a bright arc pixel by
-    10^3 to 10^5, and the number it returns is not a goodness of fit: scoring
-    PURE NOISE on the old convention gives a median chi2/dof near 1,800, not 1.
-
-    The default is nevertheless gain = 0.0, deliberately. This is a library
-    function called from eight scripts, and silently changing what an existing
-    call means is worse than making every caller say what it wants. Each script
-    now exposes `--poisson-gain`, defaulting to noise_model.POISSON_GAIN, and
-    passes it through. `--poisson-gain 0` anywhere reproduces the arithmetic of
-    the R/PS submission exactly, because gain = 0 short-circuits to the scalar
-    path below rather than approximating it.
-
-    `frac` adds a MULTIPLICATIVE term, for model error rather than photon noise
-    (a PSF-shape error is a fixed fraction of the model, so its variance goes as
-    flux squared). It is a different quantity from `gain` and the two must not be
-    tuned against each other -- see the noise_model.py header.
+    sigma is a scalar per image (background rms). Model_A ships no noise map;
+    the arcs sit at r < 30 px on a 127 px grid so the r > 50 px annulus is
+    source-free, and `image` vs `image_nss` differ there by sqrt(2) times that
+    value, confirming both carry independent detector noise and the estimate is
+    not picking up residual signal.
     """
-    if gain <= 0.0 and frac <= 0.0:
-        # The original expression, character for character, so this path is
-        # bit-identical and not merely numerically close. Do not "simplify" it
-        # into the weighted form below: dividing then squaring and squaring then
-        # dividing differ in the last bit, and reproducing the submitted numbers
-        # exactly is the whole point of keeping this branch.
-        q = ((pred - data) / max(sigma, EPS)) ** 2
-    else:
-        m = np.clip(pred, 0.0, None)
-        var = np.clip(max(sigma, EPS) ** 2 + gain * m + (frac * m) ** 2,
-                      EPS, None)
-        d = pred - data
-        q = d * d / var
+    r = (pred - data) / max(sigma, EPS)
     if mask is not None:
-        q = q[mask]
-    n = q.size
-    return float(q.sum() / max(n - n_params, 1))
+        r = r[mask]
+    n = r.size
+    return float((r ** 2).sum() / max(n - n_params, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -234,27 +197,16 @@ def stratify(rows, key: str, by: str = "snr_max",
     return "\n".join(lines)
 
 
-def null_baselines(images, sigmas, gain: float = 0.0,
-                   frac: float = 0.0) -> Dict[str, float]:
+def null_baselines(images, sigmas) -> Dict[str, float]:
     """chi2/dof of models that contain no physics, as a sanity floor.
 
     Reported alongside the fit so a reviewer can see what "1.0" is worth on this
     data. The equivalent exercise on `skill` is what exposed that metric.
-
-    `gain` and `frac` are forwarded to chi2_per_dof so the nulls are scored on
-    the SAME noise model as the fit. Scoring the nulls one way and the fit
-    another makes the comparison meaningless, which is the specific trap that
-    the background-only convention set: a blur of the input and a physical model
-    were both inflated, but not by the same factor, because the inflation scales
-    with how much flux the model puts on the bright pixels.
     """
     from scipy.ndimage import gaussian_filter
     out = {"constant": [], "blur2": [], "blur3": []}
     for img, sig in zip(images, sigmas):
-        out["constant"].append(chi2_per_dof(np.full_like(img, img.mean()), img,
-                                            sig, gain=gain, frac=frac))
-        out["blur2"].append(chi2_per_dof(gaussian_filter(img, 2.0), img, sig,
-                                         gain=gain, frac=frac))
-        out["blur3"].append(chi2_per_dof(gaussian_filter(img, 3.0), img, sig,
-                                         gain=gain, frac=frac))
+        out["constant"].append(chi2_per_dof(np.full_like(img, img.mean()), img, sig))
+        out["blur2"].append(chi2_per_dof(gaussian_filter(img, 2.0), img, sig))
+        out["blur3"].append(chi2_per_dof(gaussian_filter(img, 3.0), img, sig))
     return {k: float(np.median(v)) for k, v in out.items()}

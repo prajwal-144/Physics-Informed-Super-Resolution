@@ -63,7 +63,6 @@ import numpy as np
 
 import metrics as M
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN, describe, variance
 from raytrace import (gaussian_psf, image_plane_grid, load_psf, moffat_psf,
                       render)
 from sources import SersicSource
@@ -85,47 +84,27 @@ def true_lens(t: dict) -> dict:
             "g1": t["gamma1_ext"], "g2": t["gamma2_ext"]}
 
 
-def linear_amp_background(model: np.ndarray, data: np.ndarray, sigma: float,
-                          gain: float = 0.0, frac: float = 0.0,
-                          passes: int = 3):
-    """Least squares for (a, b) in  a*model + b ~ data, inverse-variance weighted.
+def linear_amp_background(model: np.ndarray, data: np.ndarray, sigma: float):
+    """Least squares for (a, b) in  a * model + b ~ data,  weighted by 1/sigma.
 
-    Closed form in (a, b) at fixed weights. When `gain` or `frac` is non-zero the
-    variance depends on the fitted model a*model + b, so this iterates: solve at
-    the current weights, rebuild the weights from the new solution, repeat. Three
-    passes is ample -- the amplitude stops moving in the fourth decimal after two.
-
-    With gain = frac = 0 the weight is a constant that cancels out of the normal
-    equations, so the result is identical to the original scalar version. That is
-    why `--poisson-gain 0` reproduces the submission exactly rather than closely.
+    Closed form. sigma is a constant here so it cancels out of the solution, but
+    it is kept in the normal equations so the code stays correct if a per-pixel
+    sigma is ever passed.
     """
+    w = 1.0 / max(sigma, 1e-12) ** 2
     m = model.astype(np.float64).ravel()
     d = data.astype(np.float64).ravel()
     n = m.size
-    s2 = max(sigma, 1e-12) ** 2
-
-    def solve(w):
-        """w is the per-pixel inverse variance: an array, or a scalar."""
-        if np.ndim(w):
-            Smm, Sm = float((w * m * m).sum()), float((w * m).sum())
-            Sdm, Sd = float((w * d * m).sum()), float((w * d).sum())
-            Snn = float(w.sum())
-        else:
-            Smm, Sm = w * float(m @ m), w * float(m.sum())
-            Sdm, Sd = w * float(d @ m), w * float(d.sum())
-            Snn = w * n
-        det = Smm * Snn - Sm * Sm
-        if abs(det) < 1e-30:
-            return 1.0, 0.0
-        return ((Sdm * Snn - Sm * Sd) / det, (Smm * Sd - Sm * Sdm) / det)
-
-    a, b = solve(1.0 / s2)
-    if gain <= 0.0 and frac <= 0.0:
-        return float(a), float(b)
-    for _ in range(max(passes - 1, 0)):
-        pred = np.clip(a * m + b, 0.0, None)
-        var = np.clip(s2 + gain * pred + (frac * pred) ** 2, 1e-24, None)
-        a, b = solve(1.0 / var)
+    Smm = w * float(m @ m)
+    Sm = w * float(m.sum())
+    Sdm = w * float(d @ m)
+    Sd = w * float(d.sum())
+    Snn = w * n
+    det = Smm * Snn - Sm * Sm
+    if abs(det) < 1e-30:
+        return 1.0, 0.0
+    a = (Sdm * Snn - Sm * Sd) / det
+    b = (Smm * Sd - Sm * Sdm) / det
     return float(a), float(b)
 
 
@@ -148,15 +127,6 @@ def main():
     ap.add_argument("--substructure-probe", action="store_true",
                     help="also report rms(image - image_nss) in the disc. READ "
                          "THE WARNING it prints before quoting the number.")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="var = sigma_bg^2 + g*model. MEASURED in noise_model.py "
-                         "two independent ways. 0 reproduces the background-only "
-                         "convention that produced the submission's 6,492 floor.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="extra multiplicative (f*model)^2 term for MODEL error. "
-                         "Leave at 0 here: the point of this script is to measure "
-                         "how much model error is left once photon noise is "
-                         "modelled, so absorbing it in advance defeats the test.")
     ap.add_argument("--out", default="superres/results/truth_chi2.json")
     a = ap.parse_args()
 
@@ -211,30 +181,18 @@ def main():
             pred = amp * unit
             bg = float(np.median((img - pred)[annulus]))
             pred = pred + bg
-            r["flux"] = {
-                "amp": amp, "background": bg,
-                "chi2_per_dof": M.chi2_per_dof(pred, img, sig, disc,
-                                               N_FIT_PARAMS,
-                                               gain=a.poisson_gain,
-                                               frac=a.sigma_floor),
-                "chi2_per_dof_bgonly": M.chi2_per_dof(pred, img, sig, disc,
-                                                      N_FIT_PARAMS),
-                "chi2_sum": float((((pred - img) / sig) ** 2)[disc].sum())}
+            r["flux"] = {"amp": amp, "background": bg,
+                         "chi2_per_dof": M.chi2_per_dof(pred, img, sig, disc,
+                                                        N_FIT_PARAMS),
+                         "chi2_sum": float((((pred - img) / sig) ** 2)[disc].sum())}
 
         if a.amp_mode in ("fit", "both"):
-            amp, bg = linear_amp_background(unit[disc], img[disc], sig,
-                                            gain=a.poisson_gain,
-                                            frac=a.sigma_floor)
+            amp, bg = linear_amp_background(unit[disc], img[disc], sig)
             pred = amp * unit + bg
-            r["fit"] = {
-                "amp": amp, "background": bg,
-                "chi2_per_dof": M.chi2_per_dof(pred, img, sig, disc,
-                                               N_FIT_PARAMS,
-                                               gain=a.poisson_gain,
-                                               frac=a.sigma_floor),
-                "chi2_per_dof_bgonly": M.chi2_per_dof(pred, img, sig, disc,
-                                                      N_FIT_PARAMS),
-                "chi2_sum": float((((pred - img) / sig) ** 2)[disc].sum())}
+            r["fit"] = {"amp": amp, "background": bg,
+                        "chi2_per_dof": M.chi2_per_dof(pred, img, sig, disc,
+                                                       N_FIT_PARAMS),
+                        "chi2_sum": float((((pred - img) / sig) ** 2)[disc].sum())}
 
         if a.substructure_probe:
             d = (img - ds.image_nss(i))[rad <= 30.0]
@@ -249,22 +207,18 @@ def main():
     print(f"  true source + true lens + {a.psf_mode} kernel, noiseless, "
           f"supersample {a.supersample}")
     print(f"  scored on the fit disc (r <= {a.fit_radius_px:.0f} px), "
-          f"dof = n_pixels - {N_FIT_PARAMS}")
-    print(f"  {describe(a.poisson_gain, a.sigma_floor)}\n")
+          f"dof = n_pixels - {N_FIT_PARAMS}\n")
 
     modes = [m for m in ("flux", "fit") if m in rows[0]]
-    print(f"   {'amplitude mode':<16} {'median':>11} {'p10':>11} {'p90':>11}"
-          f" {'bg-only median':>16}")
+    print(f"   {'amplitude mode':<16} {'median':>11} {'p10':>11} {'p90':>11}")
     summary = {}
     for m in modes:
         v = np.array([x[m]["chi2_per_dof"] for x in rows], dtype=float)
-        vb = np.array([x[m]["chi2_per_dof_bgonly"] for x in rows], dtype=float)
         summary[m] = {"median": float(np.median(v)),
                       "p10": float(np.percentile(v, 10)),
-                      "p90": float(np.percentile(v, 90)),
-                      "median_bgonly": float(np.median(vb))}
-        print(f"   {m:<16} {np.median(v):>11.2f} {np.percentile(v, 10):>11.2f} "
-              f"{np.percentile(v, 90):>11.2f} {np.median(vb):>16.0f}")
+                      "p90": float(np.percentile(v, 90))}
+        print(f"   {m:<16} {np.median(v):>11.1f} {np.percentile(v, 10):>11.1f} "
+              f"{np.percentile(v, 90):>11.1f}")
 
     snr = np.array([x["snr_max"] for x in rows], dtype=float)
     print(f"\n   stratified by snr_max (median chi2/dof):")
@@ -281,34 +235,15 @@ def main():
         print("   " + f"{lab:>12} {int(msk.sum()):>12d} " +
               " ".join(f"{c:>12.1f}" for c in cells))
 
-    print("\n   HOW TO READ THIS -- READ ALL OF IT")
-    print("   This is the TRUE source through the TRUE lens. Whatever it scores is")
-    print("   the ceiling on what any fit can reach, so the floor's value is a")
-    print("   statement about the NOISE MODEL and the instrument model, nothing else.")
-    print()
+    print("\n   HOW TO READ THIS")
+    print("   The per-image fit reports chi2/dof ~ 3228 on the same convention.")
     for m in modes:
-        med, medb = summary[m]["median"], summary[m]["median_bgonly"]
-        print(f"     {m:<5} floor: {med:.2f} on the corrected variance,"
-              f" {medb:.0f} on background-only")
-        if medb > 0:
-            print(f"            -> the background-only convention inflated this"
-                  f" floor {medb / max(med, 1e-9):.0f}x")
-    print()
-    print("   If the corrected floor is near 1, the submission's 6,492 was photon")
-    print("   noise scored with the wrong variance, NOT substructure, and the")
-    print("   sentence 'chi2/dof cannot reach 1 because the data contain subhalo")
-    print("   substructure' has to be withdrawn and replaced by this measurement.")
-    print()
-    print("   If it settles WELL ABOVE 1, that excess is real model error -- the")
-    print("   PSF shape and the substructure the smooth model omits -- and it is")
-    print("   now isolated and quantified instead of being tangled up with the")
-    print("   noise. Either outcome is a result. Quote the number you get here,")
-    print("   not the one in the submission.")
-    print()
-    print("   Then re-fit with the same --poisson-gain and compare the fit's")
-    print("   chi2_per_dof against this floor. The RATIO is the meaningful")
-    print("   quantity; the absolute numbers depend on the convention and the")
-    print("   two must always be computed on the same one.")
+        ratio = 3228.0 / summary[m]["median"] if summary[m]["median"] > 0 else np.inf
+        print(f"     vs the {m} floor ({summary[m]['median']:.0f}): "
+              f"the fit is {ratio:.2f}x the floor")
+    print("   A ratio near 1 means the residual is model family and substructure,")
+    print("   not fitting failure, and the paper's explanation stands. A ratio")
+    print("   well above 1 means part of the excess is yours to explain.")
 
     if a.substructure_probe:
         v = np.array([x["nss_rms_r30"] for x in rows], dtype=float)

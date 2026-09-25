@@ -36,7 +36,6 @@ import metrics as M
 from backproject import backproject, ray_shoot_batch, sample_source
 from data_a import ModelADataset
 from eval_b4 import to_detector
-from noise_model import POISSON_GAIN, describe
 from raytrace import area_downsample, convolve, image_plane_grid, load_psf
 from sisr_net import SourceSISR
 from sources import SersicSource
@@ -51,11 +50,6 @@ def main():
     ap.add_argument("--n", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--n-save", type=int, default=6)
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="photon-noise term in the reported chi^2. "
-                         "See noise_model.py; 0 gives the paper's number.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="multiplicative model-error term (f*model)^2.")
     ap.add_argument("--out", default="superres/results/b5_gate_metrics.json")
     ap.add_argument("--out-npz", default="superres/results/b5_gate_examples.npz")
     a = ap.parse_args()
@@ -159,17 +153,10 @@ def main():
             st_b5.append(M.source_truth(convolve(det[j], psf_np), tru, res))
             par = SersicSource({kk: lens_rows[i][kk] for kk in SRC_KEYS}).at(Xl, Yl)
             st_par.append(M.source_truth(convolve(par, psf_np), tru, res))
-            d_ij = pr[j] - imgs[j]
-            s2 = max(sigs[j], 1e-12) ** 2
-            mj = np.clip(pr[j], 0.0, None)
-            var = np.clip(s2 + a.poisson_gain * mj
-                          + (a.sigma_floor * mj) ** 2, 1e-24, None)
-            dofj = mask_np.sum() - 14
+            r = (pr[j] - imgs[j]) / max(sigs[j], 1e-12)
             rows.append({"index": i,
-                         "chi2_per_dof": float((d_ij ** 2 / var)[mask_np].sum()
-                                               / dofj),
-                         "chi2_per_dof_bgonly": float(
-                             ((d_ij ** 2 / s2)[mask_np]).sum() / dofj),
+                         "chi2_per_dof": float((r[mask_np] ** 2).sum()
+                                               / (mask_np.sum() - 14)),
                          "snr_max": ds.truth(i)["snr_max"],
                          "src_flux_in_box": float(
                              np.clip(det[j], 0, None).sum()
@@ -205,15 +192,8 @@ def main():
     print("\n2. WELL-POSEDNESS\n")
     print(f"   flux in box: p10 {np.percentile(fb,10):.3f}  median {np.median(fb):.3f}"
           f"  p90 {np.percentile(fb,90):.3f}   (ceiling ~0.89 at H=1.2)")
-    chb = np.array([r["chi2_per_dof_bgonly"] for r in rows], float)
-    print(f"   {describe(a.poisson_gain, a.sigma_floor)}")
-    print(f"   chi2/dof            median {np.median(ch):.2f}"
-          f"   p10 {np.percentile(ch,10):.2f}   p90 {np.percentile(ch,90):.2f}")
-    print(f"   chi2/dof (bg-only)  median {np.median(chb):.0f}"
-          f"   p10 {np.percentile(chb,10):.0f}   p90 {np.percentile(chb,90):.0f}"
-          f"   <- the paper's convention")
-    print("   NOTE the gate-vs-control paired test is a RELATIVE comparison and")
-    print("   survives either convention, provided both sides use the same one.")
+    print(f"   chi2/dof (plain sigma): median {np.median(ch):.0f}"
+          f"   p10 {np.percentile(ch,10):.0f}   p90 {np.percentile(ch,90):.0f}")
     if gate_frac:
         print(f"\n   mean gate value {np.mean(gate_frac):.3f}"
               f"  -- the fraction of the source box where the full "

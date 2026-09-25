@@ -78,7 +78,6 @@ except Exception as exc:                                    # pragma: no cover
 
 from backproject import backproject, ray_shoot_batch, sample_source
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN
 from raytrace import area_downsample, convolve, image_plane_grid, load_psf
 from sisr_net import SourceSISR
 from sources import SersicSource
@@ -213,25 +212,12 @@ def experiment_a(run, ds, lens_rows, idx, GX, GY, n_pix, bins):
 # ===========================================================================
 
 def experiment_b(run, ds, lens_rows, idx, GX, GY, n_pix, rng,
-                 clump_fwhm=0.08, clump_frac=0.15, n_pos=24, ap_px=2.0,
-                 poisson_gain=POISSON_GAIN):
+                 clump_fwhm=0.08, clump_frac=0.15, n_pos=24, ap_px=2.0):
     """Inject a sub-detector-pixel clump, recover it, and record the local mu.
 
     clump_fwhm is in arcsec. The default 0.08 is 0.76 detector pixels and 1.57
     super-resolution pixels: invisible to the detector on its own, marginally
     resolvable on the output grid. That is the whole point.
-
-    NOISE -- CHANGED. This used to add sigma_bg everywhere, i.e. flat noise. The
-    real noise is var = sigma_bg^2 + flux/t (noise_model.py), so the arcs were
-    being under-noised by 10^3 to 10^5 in variance -- exactly where the injected
-    clump lands. That systematically OVERSTATED recoverability on bright arcs,
-    and since bright arcs are the high-mu ones, it biased the headline
-    mu-versus-contrast trend in the direction the experiment was testing for.
-
-    The shared-realisation trick is preserved exactly: one unit-normal field is
-    drawn per image and scaled by the sigma map of the CLUMP-FREE model, so the
-    with- and without-clump renders still differ by the clump alone and not by
-    sqrt(2) times the noise.
     """
     Xs, Ys = source_axes(run.n_out, run.H)
     sc = 2 * run.H / (run.n_out - 1)
@@ -261,19 +247,9 @@ def experiment_b(run, ds, lens_rows, idx, GX, GY, n_pix, rng,
         # Drawing independent noise makes the difference clump + sqrt(2)*noise,
         # which buries the signal -- the first version of this function did that
         # and measured Spearman(mu, contrast) = -0.04 on pure noise.
-        #
-        # The unit field is drawn once and scaled by the sigma map of the
-        # clump-free model, so it stays ONE realisation while still having the
-        # right amplitude per pixel. Using the clump-free model for both (rather
-        # than each render's own model) is what keeps it shared; the clump is a
-        # 15 per cent perturbation so the variance difference is negligible.
-        clean0 = run.render(base, r, r["background"], n_pix, GX, GY)
-        sig_map = np.sqrt(np.clip(noise ** 2
-                                  + poisson_gain * np.clip(clean0, 0.0, None),
-                                  1e-24, None))
-        eps = rng.standard_normal((n_pix, n_pix)) * sig_map
+        eps = rng.normal(0.0, noise, (n_pix, n_pix))
 
-        img0 = clean0 + eps
+        img0 = run.render(base, r, r["background"], n_pix, GX, GY) + eps
         S0, cov = run.reconstruct(img0, r, src_d, noise, GX, GY)
         m = run.a["mag"]
         cov_up = np.kron(cov, np.ones((m, m)))[:run.n_out, :run.n_out]
@@ -282,10 +258,6 @@ def experiment_b(run, ds, lens_rows, idx, GX, GY, n_pix, rng,
             x0, y0 = Xs[pi, pj], Ys[pi, pj]
             clump = A * np.exp(-((Xs - x0) ** 2 + (Ys - y0) ** 2) / (2 * sig_c ** 2))
             img1 = run.render(base + clump, r, r["background"], n_pix, GX, GY) + eps
-            # `noise` (sigma_bg) is passed to reconstruct() as the NETWORK
-            # INPUT scaling -- arcsinh(back-projection / sigma) -- not as a
-            # likelihood weight, so it must stay sigma_bg to match how the
-            # checkpoint was trained. Only the noise ADDED above changed.
             S1, _ = run.reconstruct(img1, r, src_d, noise, GX, GY)
 
             d = S1 - S0
@@ -364,13 +336,6 @@ def main():
                     help="arcsec; 0.08 is 0.76 detector pixels")
     ap.add_argument("--clump-frac", type=float, default=0.15,
                     help="clump peak as a fraction of the Sersic peak")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="photon noise added to the injected renders: "
-                         "var = sigma_bg^2 + g*model. Model_A was generated "
-                         "this way (noise_model.py), so 0 under-noises the "
-                         "arcs by 10^3-10^5 in variance and OVERSTATES "
-                         "sub-pixel recoverability exactly where mu is high. "
-                         "0 reproduces the number in the submission.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default="superres/results")
     ap.add_argument("--out", default="superres/results/mu_resolution.json")
@@ -418,8 +383,7 @@ def main():
     print(f"\nB. SUB-PIXEL CLUMP INJECTION  "
           f"(FWHM {a.clump_fwhm}\" = {a.clump_fwhm/run.res:.2f} detector px)\n")
     b_rows = experiment_b(run, ds, lens_rows, idx, GX, GY, n_pix, rng,
-                          a.clump_fwhm, a.clump_frac, a.n_pos,
-                          poisson_gain=a.poisson_gain)
+                          a.clump_fwhm, a.clump_frac, a.n_pos)
     if b_rows:
         mu = np.array([r["mu"] for r in b_rows]); ct = np.array([r["contrast"] for r in b_rows])
         print(f"   {len(b_rows)} injections over {len(idx)} images")

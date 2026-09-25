@@ -84,7 +84,6 @@ except Exception as exc:                                    # pragma: no cover
     raise SystemExit(f"train_b5_mu.py needs torch (import failed: {exc})")
 
 from backproject import backproject, ray_shoot_batch, sample_source
-from noise_model import POISSON_GAIN, describe
 from raytrace import area_downsample, image_plane_grid, load_psf
 from sisr_net import SourceSISR
 from sources import SersicSource
@@ -153,13 +152,7 @@ def main():
     ap.add_argument("--reg-power", type=float, default=0.5)
     ap.add_argument("--lambda-curv", type=float, default=3.0)
     ap.add_argument("--lambda-l2", type=float, default=0.5)
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="PHOTON NOISE: var += g * model. See noise_model.py. "
-                         "0 restores the R/PS background-only variance.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="MODEL ERROR: var += (f*model)^2. Was 0.02 in the R/PS "
-                         "runs, where it was standing in for photon noise with "
-                         "the wrong power of flux. Default 0 now.")
+    ap.add_argument("--sigma-floor", type=float, default=0.02)
     # ---- the two new things ------------------------------------------
     ap.add_argument("--mu-gate", type=float, default=2.0,
                     help="mu below which the super-resolution detail is removed. "
@@ -220,12 +213,7 @@ def main():
     else:
         print("mu gate OFF -- this run reproduces B4")
     print(f"curvature weighting: {'mu-weighted' if a.curv_mu else 'uniform'}"
-          f"   lambda_curv {a.lambda_curv}   lambda_l2 {a.lambda_l2}")
-    print(describe(a.poisson_gain, a.sigma_floor))
-    if a.poisson_gain <= 0:
-        print("  *** background-only variance: reproduces the R/PS run and is NOT")
-        print("  *** the noise Model_A was generated with.")
-    print()
+          f"   lambda_curv {a.lambda_curv}   lambda_l2 {a.lambda_l2}\n")
 
     def step(X, S, L, P, BG, train):
         X, S, L = X.to(dev), S.to(dev), L.to(dev)
@@ -258,16 +246,10 @@ def main():
         sky = F.conv2d(F.pad(sky, (pad,) * 4, mode="replicate"), psf[None, None])
         pred = area_downsample(sky, a.supersample)[:, 0] + BG.reshape(-1, 1, 1)
 
-        # Per-pixel variance; see the note in train_b4.py. pred.detach() keeps
-        # the weights constant across the step by construction.
-        var = (S[:, None, None]) ** 2
-        if a.poisson_gain > 0 or a.sigma_floor > 0:
-            m = pred.detach().clamp_min(0.0)
-            if a.poisson_gain > 0:
-                var = var + a.poisson_gain * m            # photon noise (data)
-            if a.sigma_floor > 0:
-                var = var + (a.sigma_floor * m) ** 2      # model error (model)
-        sig = torch.sqrt(var.clamp_min(1e-24))
+        sig = S[:, None, None]
+        if a.sigma_floor > 0:
+            sig = torch.sqrt(sig ** 2 +
+                             (a.sigma_floor * pred.detach().clamp_min(0.0)) ** 2)
         chi2 = ((((pred - X) / sig)[:, mask]) ** 2).mean()
 
         rel = (S_map - (base_out if base_out is not None else 0.0)) / amp

@@ -66,7 +66,6 @@ except Exception as exc:                                    # pragma: no cover
 
 import metrics as M
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN, describe
 from raytrace import convolve, image_plane_grid, load_psf
 from sources import SersicSource
 from theta_e_init import initial_guess
@@ -112,12 +111,6 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--fits", default="superres/results/fits_img.json",
                     help="per-image fits, for the head-to-head")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="photon-noise term in the reported chi^2: "
-                         "var = sigma_bg^2 + g*model. See noise_model.py. "
-                         "0 gives the background-only number the paper quotes.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="multiplicative model-error term (f*model)^2.")
     ap.add_argument("--n-save", type=int, default=6)
     ap.add_argument("--out", default="superres/results/fits_pathb.json")
     ap.add_argument("--out-npz", default="superres/results/pathb_examples.npz")
@@ -192,21 +185,8 @@ def main():
         t_all += time.time() - t0
 
         cov = ray_coverage(bx, by, ta["n_c"], ta["half_extent"])
-        dofj = int(mask_np.sum()) - 14 - ta["n_c"] ** 2
-        # background-only: the convention the R/PS submission quotes
         r = ((pred - Xb) / Sb[:, None, None])[:, mask]
-        chi2_bg = (r ** 2).sum(1) / dofj
-        # corrected: photon noise included (noise_model.py)
-        if a.poisson_gain > 0 or a.sigma_floor > 0:
-            m_ = pred.detach().clamp_min(0.0)
-            var = (Sb[:, None, None]) ** 2
-            if a.poisson_gain > 0:
-                var = var + a.poisson_gain * m_
-            if a.sigma_floor > 0:
-                var = var + (a.sigma_floor * m_) ** 2
-            chi2 = (((pred - Xb) ** 2 / var.clamp_min(1e-24))[:, mask]).sum(1) / dofj
-        else:
-            chi2 = chi2_bg
+        chi2 = (r ** 2).sum(1) / (int(mask_np.sum()) - 14 - ta["n_c"] ** 2)
 
         for j, i in enumerate(idx):
             row = {kk: float(p[kk][j]) for kk in FIT_KEYS}
@@ -214,9 +194,6 @@ def main():
                        ring_m1=float(ring[j, 1]), ring_m2=float(ring[j, 2]),
                        index=i, path=str(ds.paths[i]), sigma=float(sigs[j]),
                        target=ta["target"], chi2_per_dof=float(chi2[j]),
-                       chi2_per_dof_bgonly=float(chi2_bg[j]),
-                       poisson_gain=float(a.poisson_gain),
-                       sigma_floor=float(a.sigma_floor),
                        n_pixels=int(mask_np.sum()),
                        n_params=14 + ta["n_c"] ** 2, seconds=np.nan,
                        e=float(np.hypot(row["e1"], row["e2"])),

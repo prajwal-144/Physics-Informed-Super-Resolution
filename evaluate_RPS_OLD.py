@@ -44,7 +44,6 @@ from scipy.stats import spearmanr
 
 import metrics as M
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN, describe
 from raytrace import (area_downsample, convolve, gaussian_psf, image_plane_grid,
                       load_psf, moffat_psf, render)
 from sources import SersicSource
@@ -74,11 +73,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fits", required=True)
     ap.add_argument("--root", default=".")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="photon-noise term for the null baselines, so they "
-                         "are scored on the SAME noise model as the fit. Match "
-                         "it to whatever --poisson-gain produced --fits.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
@@ -146,43 +140,20 @@ def main():
     # ---- goodness of fit ----------------------------------------------
     print("\n3. GOODNESS OF FIT\n")
     chi = np.array([r["chi2_per_dof"] for r in rows], float)
-    g_fit = float(rows[0].get("poisson_gain", 0.0))
-    f_fit = float(rows[0].get("sigma_floor", 0.0))
-    print(f"   fits were produced with: {describe(g_fit, f_fit)}")
-    print(f"   chi2/dof   median {np.median(chi):.2f}   p10 {np.percentile(chi,10):.2f}"
-          f"   p90 {np.percentile(chi,90):.2f}")
-    if "chi2_per_dof_bgonly" in rows[0]:
-        cb = np.array([r["chi2_per_dof_bgonly"] for r in rows], float)
-        print(f"   chi2/dof   median {np.median(cb):.0f} on the OLD background-only"
-              f" convention (the paper's number)")
-    if abs(g_fit - a.poisson_gain) > 1e-12:
-        print(f"   *** WARNING: --poisson-gain {a.poisson_gain} here does not match")
-        print(f"   *** the {g_fit} used for the fits. The null baselines below will")
-        print(f"   *** be on a different noise model than chi2/dof above.")
+    print(f"   chi2/dof   median {np.median(chi):.1f}   p10 {np.percentile(chi,10):.1f}"
+          f"   p90 {np.percentile(chi,90):.1f}")
     imgs = [ds.image_nss(r["index"]) if r.get("target") == "image_nss"
             else ds.image(r["index"]) for r in rows[:12]]
     sigs = [r["sigma"] for r in rows[:12]]
-    nb = M.null_baselines(imgs, sigs, gain=a.poisson_gain, frac=a.sigma_floor)
-    print(f"   null baselines (median chi2/dof, same noise model): " +
-          "   ".join(f"{k} {v:.2f}" for k, v in nb.items()))
-    print("\n   WHAT LIMITS chi2/dof HERE")
-    print("   Two effects were conflated until noise_model.py separated them.")
-    print("   (1) PHOTON NOISE. Model_A was generated with")
-    print("       var = sigma_bg^2 + flux/t, not sigma_bg^2. Scoring a pure-noise")
-    print("       residual on the background-only convention gives a median")
-    print("       chi2/dof near 1,800, so most of the historic excess -- and the")
-    print("       6,492 'floor' -- was the variance, not the model.")
-    print("   (2) PSF SHAPE, which is real and remains. calibrate_psf.py finds")
-    print("       Moffat-like wings: at r = 0.25 arcsec the true kernel is 0.139")
-    print("       of its peak against 0.005 for a 0.18 arcsec Gaussian. Its")
-    print("       signature is a residual that scales with the MODEL (flux^2 in")
-    print("       variance), which --sigma-floor absorbs; photon noise scales")
-    print("       with flux. Different powers, so they are separable -- run")
-    print("       truth_chi2.py at this --poisson-gain to size what is left.")
-    print("   The old note here claimed 'a 1% kernel error is a ~50 sigma")
-    print("   per-pixel residual'. That used sigma_bg on a bright arc pixel and")
-    print("   overstates it by roughly sqrt(1 + g*flux/sigma_bg^2), which is a")
-    print("   factor of order 100. Do not quote the 50 sigma figure.")
+    nb = M.null_baselines(imgs, sigs)
+    print(f"   null baselines (median chi2/dof): " +
+          "   ".join(f"{k} {v:.0f}" for k, v in nb.items()))
+    print("\n   chi2/dof does not reach 1 and the reason is measured, not guessed:")
+    print("   calibrate_psf.py extracts the PSF empirically and finds Moffat-like")
+    print("   wings -- at r = 0.25 arcsec the true kernel is 0.139 of its peak")
+    print("   against 0.005 for a 0.18 arcsec Gaussian. Model_A arcs reach")
+    print("   peak/sigma_bg of 10^3-10^4, so a 1% kernel-shape error is a ~50 sigma")
+    print("   per-pixel residual. The PSF SHAPE, not the parameters, is the floor.")
 
     # ---- stratified ----------------------------------------------------
     print("\n4. STRATIFIED BY snr_max\n")

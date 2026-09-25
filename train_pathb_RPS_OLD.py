@@ -120,23 +120,11 @@ sigma was the background std alone, so a bright arc produced residuals of
 
 v2 fixes exactly that:
 
-  1. --sigma-floor 0.02: sigma_eff^2 = sigma_bg^2 + (0.02 * model)^2, which
-     flattens chi^2 across SNR from 1411 -> 8455 down to 329 -> 229 and cuts the
-     p90/p10 spread from 95x to 8.7x.
-
-     CORRECTED 2026-09: this was described here as "the correct noise model,
-     not a fudge". It is not. Model_A was generated with
-
-         var = sigma_bg^2 + flux / t
-
-     -- photon noise, variance LINEAR in flux -- which noise_model.py measures
-     two independent ways at gain ~= 0.8. The fractional floor is variance in
-     flux SQUARED, so it was standing in for photon noise with the wrong power
-     and getting the right qualitative behaviour for the wrong reason. Use
-     --poisson-gain for the photon term; --sigma-floor now defaults to 0 and
-     means only what its name says: a multiplicative MODEL error. A sweep of it
-     against the true-source chi^2 floor moves the median by 4 per cent, so it
-     is not what limits this pipeline.
+  1. --sigma-floor 0.02: sigma_eff^2 = sigma_bg^2 + (0.02 * model)^2. The PSF
+     wings are measured to be wrong at the 1-3% level (calibrate_psf.py) and
+     that error scales with flux, so this is the correct noise model, not a
+     fudge. On the per-image fits it flattens chi^2 across SNR from
+     1411 -> 8455 down to 329 -> 229 and cuts the p90/p10 spread from 95x to 8.7x.
   2. lambda is now a FRACTION OF chi^2 (multiplied by chi2.detach()), so it is
      scale-free and cannot be silently six orders out again.
   3. tanh saturation is measured and printed EVERY epoch, and warned about at
@@ -174,7 +162,6 @@ except Exception as exc:                                    # pragma: no cover
 
 from data_a import ModelADataset
 from lens_models import deflection
-from noise_model import POISSON_GAIN, describe
 from raytrace import area_downsample, image_plane_grid, load_psf
 from sources import SersicSource
 from theta_e_init import initial_guess
@@ -580,12 +567,7 @@ def main():
                     help="Laplacian smoothness penalty on the source map, also "
                          "as a fraction of chi^2. Optional in b3; ESSENTIAL in "
                          "b2, where 3.0 is a sane starting value.")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="PHOTON NOISE: var += g * model. Model_A was generated "
-                         "with var = sigma_bg^2 + flux/t; noise_model.py measures "
-                         "g two independent ways. Physics, not a knob. 0 restores "
-                         "the background-only variance of the R/PS runs.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
+    ap.add_argument("--sigma-floor", type=float, default=0.02,
                     help="fractional systematic error floor: "
                          "sigma_eff^2 = sigma_bg^2 + (f * model)^2. "
                          "THE SINGLE MOST IMPORTANT FLAG IN THIS FILE -- see the "
@@ -667,18 +649,13 @@ def main():
         print("  *** --supersample 2 is the real fix (4x the rays, ~4x the cost).")
     print(f"source mode {a.source_mode}   reg {a.reg_mode}   "
           f"lambda_corr {a.lambda_corr} x chi2   lambda_curv {a.lambda_curv} x chi2")
-    print(f"augment {bool(a.augment)}   weight decay {a.weight_decay}   "
-          f"warmup {a.warmup_epochs} epochs")
-    print(describe(a.poisson_gain, a.sigma_floor))
-    if a.poisson_gain <= 0 and a.sigma_floor <= 0:
-        print("  *** BOTH terms off. This is the v1 loss, in which one image in a")
-        print("  *** batch of 16 took 54% of the gradient and the effective batch")
-        print("  *** size was 2. Use it only to reproduce that failure.")
-    elif a.poisson_gain <= 0:
-        print("  *** background + fractional floor only: reproduces the R/PS runs.")
-        print("  *** It is NOT the noise Model_A was generated with -- the floor")
-        print("  *** stands in for photon noise with the wrong power of flux.")
-    print()
+    print(f"sigma floor {a.sigma_floor:.3f} (fractional systematic)   "
+          f"augment {bool(a.augment)}   weight decay {a.weight_decay}   "
+          f"warmup {a.warmup_epochs} epochs\n")
+    if a.sigma_floor <= 0:
+        print("  *** sigma-floor = 0 reproduces the v1 loss, in which one image")
+        print("  *** in a batch of 16 took 54% of the gradient. Do not use it")
+        print("  *** except to reproduce the failure.\n")
 
     n_skip = [0]
     hist = []
@@ -721,18 +698,10 @@ def main():
         # multiplicative systematic, and on the per-image fits it flattens the
         # chi^2-vs-SNR trend from 1411 -> 8455 down to 329 -> 229 and cuts the
         # p90/p10 spread from 95x to 8.7x.
-        # Per-pixel variance. pred.detach() is load-bearing: the weights must be
-        # constants of the step, or the network can lower chi^2 by shrinking the
-        # model to inflate its own denominator.
         sig = S[:, None, None]
-        if a.poisson_gain > 0 or a.sigma_floor > 0:
-            m_ = pred.detach().clamp_min(0.0)
-            var = sig ** 2
-            if a.poisson_gain > 0:
-                var = var + a.poisson_gain * m_        # photon noise (the DATA)
-            if a.sigma_floor > 0:
-                var = var + (a.sigma_floor * m_) ** 2  # model error (the MODEL)
-            sig = torch.sqrt(var.clamp_min(1e-24))
+        if a.sigma_floor > 0:
+            sig = torch.sqrt(sig ** 2 +
+                             (a.sigma_floor * pred.detach().clamp_min(0.0)) ** 2)
         r = ((pred - X) / sig)[:, mask]
         chi2 = (r ** 2).mean()
 

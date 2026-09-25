@@ -19,7 +19,7 @@
   "substructure_probe": false,
   "poisson_gain": 0.8,
   "sigma_floor": 0.0,
-  "out": "superres/results/truth_chi2.json"
+  "out": "superres/results/truth_chi2_f0.00.json"
  },
  "n": 500,
  "summary": {

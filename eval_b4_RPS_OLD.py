@@ -1,16 +1,40 @@
 """
-eval_b5_mu.py -- score a B5 (magnification-gated) checkpoint.
+eval_b4.py -- score a trained B4 network against the true source.
 
-Deliberately writes the SAME JSON schema as eval_b4.py, so
-make_figures_b4.py and make_figures_b4_stages.py both work on a B5 run with
-`--metrics superres/results/b5_gate_metrics.json`, and the B4-vs-B5 comparison
-is made with identical scoring code.
+WHAT IS BEING COMPARED, AND WHY IT IS A FAIR TEST
+--------------------------------------------------
+Four methods now solve the SAME problem -- reconstruct the source given a
+correct, per-image, unsupervised lens -- so they can be put in one table:
 
-The only difference from eval_b4.py is the gate applied after the network and
-before the forward lensing -- imported from train_b5_mu so the two cannot drift.
+  1. Sersic (Path A / refined)   7 parameters, exactly the right prior for
+                                 Model_A, so this is the number to beat
+  2. Option 2 linear inversion   64^2 free pixels, semilinear + L-curve, no
+                                 learned prior            (Option2_failed/)
+  3. B3 decoder                  Sersic + a 32^2 correction from a
+                                 globally-pooled 128-vector
+  4. B4 (this file)              back-projection -> fully-convolutional SISR
+
+All four are scored by metrics.source_truth() against the npz `unlensed` array
+with the model PSF-convolved first, on the same validation images. Any
+difference is a difference in the method, not in the scoring.
+
+WHAT TO LOOK AT FIRST
+---------------------
+`size_ratio` and `peak_ratio`. The original grid-based pipeline reported
+size_ratio 10.6-12.8 across a 100x regularisation sweep -- the source was an
+order of magnitude too large. That single number is the reason this project was
+rewritten, and it is the one that says whether a free-form source is working.
+
+A NOTE ON WHAT "GOOD" MEANS HERE
+--------------------------------
+Model_A's sources genuinely ARE Sersics. A free-form model therefore has no
+prior advantage and should not be expected to beat the 7-parameter fit on this
+data. The defensible claim for B4 is that it comes CLOSE without assuming a
+parametric family -- which is what real galaxies require -- and that it is well
+posed, which the original pipeline's version was not.
 
 Run from the Grid_Based_Experiment root:
-    python superres/eval_b5_mu.py --ckpt superres/results/b5_gate_best.pt --root .
+    python superres/eval_b4.py --ckpt superres/results/b4_best.pt --root .
 """
 from __future__ import annotations
 
@@ -30,34 +54,45 @@ try:
     import torch
     import torch.nn.functional as F
 except Exception as exc:                                    # pragma: no cover
-    raise SystemExit(f"eval_b5_mu.py needs torch (import failed: {exc})")
+    raise SystemExit(f"eval_b4.py needs torch (import failed: {exc})")
 
 import metrics as M
 from backproject import backproject, ray_shoot_batch, sample_source
 from data_a import ModelADataset
-from eval_b4 import to_detector
-from noise_model import POISSON_GAIN, describe
 from raytrace import area_downsample, convolve, image_plane_grid, load_psf
 from sisr_net import SourceSISR
 from sources import SersicSource
 from train_b4 import LENS_KEYS, SRC_KEYS, build_inputs
-from train_b5_mu import apply_gate, mu_gate
+
+
+def to_detector(S_map, half_extent, n_pix, res):
+    """Resample a source map from its own box onto the detector grid.
+
+    The npz `unlensed` array lives on the 127-px detector grid in source-plane
+    coordinates, so the model source has to be put on that grid before
+    metrics.source_truth() can compare them. Outside the box the source is zero,
+    which is correct -- a boxed model genuinely has no flux there, and hiding
+    that would flatter the method.
+    """
+    ax = (np.arange(n_pix) - (n_pix - 1) / 2.0) * res
+    XX, YY = np.meshgrid(ax, ax, indexing="xy")[0], np.meshgrid(ax, ax, indexing="ij")[0]
+    bx = torch.as_tensor(XX, dtype=S_map.dtype, device=S_map.device)[None]
+    by = torch.as_tensor(YY, dtype=S_map.dtype, device=S_map.device)[None]
+    out = []
+    for i in range(S_map.shape[0]):
+        out.append(sample_source(S_map[i:i + 1], bx, by, half_extent)[0])
+    return torch.stack(out)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ckpt", default="superres/results/b5_gate_best.pt")
+    ap.add_argument("--ckpt", default="superres/results/b4_best.pt")
     ap.add_argument("--root", default=".")
     ap.add_argument("--n", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--n-save", type=int, default=6)
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="photon-noise term in the reported chi^2. "
-                         "See noise_model.py; 0 gives the paper's number.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="multiplicative model-error term (f*model)^2.")
-    ap.add_argument("--out", default="superres/results/b5_gate_metrics.json")
-    ap.add_argument("--out-npz", default="superres/results/b5_gate_examples.npz")
+    ap.add_argument("--out", default="superres/results/b4_metrics.json")
+    ap.add_argument("--out-npz", default="superres/results/b4_examples.npz")
     a = ap.parse_args()
 
     try:
@@ -66,7 +101,8 @@ def main():
         ck = torch.load(a.ckpt, map_location="cpu")
     ta = ck["args"]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    res, H = ta["pixel_scale"], ta["half_extent"]
+    res = ta["pixel_scale"]
+    H = ta["half_extent"]
 
     lens_rows = {r["index"]: r for r in json.load(open(ta["lens_fits"]))["rows"]}
     ds = ModelADataset(a.root, split="val", classes=ta["classes"],
@@ -74,9 +110,9 @@ def main():
     ds.assert_rows_match(lens_rows, ta["lens_fits"])
     idx = [i for i in range(len(ds)) if i in lens_rows]
     n_pix = ds.image(0).shape[-1]
+
     n_in = int(round(2 * H / res)) + 1
     n_out = n_in * ta["mag"]
-
     net = SourceSISR(in_ch=2 + (ta["base"] == "sersic"), width=ta["width"],
                      depth=ta["depth"], mag=ta["mag"], n_up=1).to(dev)
     net.load_state_dict(ck["model"])
@@ -93,23 +129,20 @@ def main():
     Xl, Yl = image_plane_grid(n_pix, res, 1)
 
     print("=" * 78)
-    print(f"B5 (mu-gated) EVALUATION   {a.ckpt}")
+    print(f"B4 EVALUATION   {a.ckpt}")
     print("=" * 78)
     h = ck.get("history", [])
     if h:
         print(f"  {len(h)} epochs   final train {h[-1]['train_chi2']:.1f}"
               f"   val {h[-1]['val_chi2']:.1f}"
               f"   gap {h[-1]['val_chi2']/max(h[-1]['train_chi2'],1e-9):.2f}x")
-    print(f"  base {ta['base']}   mu_gate {ta['mu_gate']} (tau {ta['gate_tau']})"
-          f"   curv_mu {ta['curv_mu']}   lambda_curv {ta['lambda_curv']}"
-          f"   lambda_l2 {ta['lambda_l2']}")
-    print(f"  source {n_out}^2 at {2*H/(n_out-1):.4f} arcsec/px"
-          f"   ({res/(2*H/(n_out-1)):.2f}x finer than the detector)")
+    print(f"  lens frozen from {ta['lens_fits']}   base {ta['base']}")
+    print(f"  source {n_out}^2 at {2*H/(n_out-1):.4f} arcsec/px "
+          f"({res/(2*H/(n_out-1)):.2f}x finer than the detector)")
     print(f"  scoring {len(idx)} val images\n")
 
-    st_b5, st_par, rows, examples = [], [], [], {}
+    st_b4, st_par, rows, examples = [], [], [], {}
     t_all, saved = 0.0, 0
-    gate_frac = []
     for k0 in range(0, len(idx), a.batch_size):
         sub = idx[k0:k0 + a.batch_size]
         imgs = np.array([ds.image(i) for i in sub])
@@ -117,6 +150,7 @@ def main():
         L = np.array([[lens_rows[i][k] for k in LENS_KEYS] for i in sub])
         P = np.array([[lens_rows[i][k] for k in SRC_KEYS] for i in sub])
         BG = np.array([lens_rows[i]["background"] for i in sub])
+
         X = torch.as_tensor(imgs, dtype=torch.float32, device=dev)
         S = torch.as_tensor(sigs, dtype=torch.float32, device=dev)
         Lt = torch.as_tensor(L, dtype=torch.float32, device=dev)
@@ -127,9 +161,6 @@ def main():
             lens = {kk: Lt[:, i] for i, kk in enumerate(LENS_KEYS)}
             bx, by = ray_shoot_batch(GX, GY, lens)
             bp, cov = backproject(X, bx, by, n_in, H)
-            g = mu_gate(cov, ta["mu_gate"], ta["gate_tau"])
-            if g is not None:
-                gate_frac.append(float(g.mean()))
             src = {kk: Pt[:, i].reshape(-1, 1, 1) for i, kk in enumerate(SRC_KEYS)}
             base_in = base_out = None
             if ta["base"] == "sersic":
@@ -144,7 +175,6 @@ def main():
             S_map = amp * y
             if base_out is not None:
                 S_map = base_out + amp * (y - float(np.log(2.0)))
-            S_map = apply_gate(S_map, g, ta["mag"])
             sky = sample_source(S_map, bx, by, H).unsqueeze(1)
             pad = psf.shape[-1] // 2
             sky = F.conv2d(F.pad(sky, (pad,) * 4, mode="replicate"), psf[None, None])
@@ -156,20 +186,13 @@ def main():
         pr = pred.cpu().numpy()
         for j, i in enumerate(sub):
             tru = ds.unlensed(i)
-            st_b5.append(M.source_truth(convolve(det[j], psf_np), tru, res))
+            st_b4.append(M.source_truth(convolve(det[j], psf_np), tru, res))
             par = SersicSource({kk: lens_rows[i][kk] for kk in SRC_KEYS}).at(Xl, Yl)
             st_par.append(M.source_truth(convolve(par, psf_np), tru, res))
-            d_ij = pr[j] - imgs[j]
-            s2 = max(sigs[j], 1e-12) ** 2
-            mj = np.clip(pr[j], 0.0, None)
-            var = np.clip(s2 + a.poisson_gain * mj
-                          + (a.sigma_floor * mj) ** 2, 1e-24, None)
-            dofj = mask_np.sum() - 14
+            r = (pr[j] - imgs[j]) / max(sigs[j], 1e-12)
             rows.append({"index": i,
-                         "chi2_per_dof": float((d_ij ** 2 / var)[mask_np].sum()
-                                               / dofj),
-                         "chi2_per_dof_bgonly": float(
-                             ((d_ij ** 2 / s2)[mask_np]).sum() / dofj),
+                         "chi2_per_dof": float((r[mask_np] ** 2).sum()
+                                               / (mask_np.sum() - 14)),
                          "snr_max": ds.truth(i)["snr_max"],
                          "src_flux_in_box": float(
                              np.clip(det[j], 0, None).sum()
@@ -184,51 +207,57 @@ def main():
                 examples[f"src_true_{saved}"] = tru.astype(np.float32)
                 examples[f"src_b4_native_{saved}"] = \
                     S_map[j].cpu().numpy().astype(np.float32)
-                if g is not None:
-                    examples[f"gate_{saved}"] = g[j].cpu().numpy().astype(np.float32)
                 saved += 1
+        if (k0 + a.batch_size) % 160 == 0:
+            print(f"  {min(k0+a.batch_size, len(idx))}/{len(idx)}", flush=True)
 
     gm = lambda L, k: float(np.nanmedian([x[k] for x in L]))
-    print("1. SOURCE PLANE vs the npz `unlensed` array\n")
+    print("\n1. SOURCE PLANE vs the npz `unlensed` array, same images, same PSF\n")
     print(f"   {'method':>34}{'corr':>9}{'size_ratio':>12}{'nmse':>9}"
           f"{'peak_ratio':>12}{'centroid px':>13}")
-    for lbl, L in (("Sersic (7 params)", st_par), ("B5 (mu-gated)", st_b5)):
+    ref = [("Sersic (7 params, the prior is exact here)", st_par),
+           ("B4: back-projection + SISR", st_b4)]
+    for lbl, L in ref:
         print(f"   {lbl:>34}{gm(L,'corr'):9.4f}{gm(L,'size_ratio'):12.4f}"
               f"{gm(L,'nmse'):9.4f}{gm(L,'peak_ratio'):12.4f}"
               f"{gm(L,'centroid_err_px'):13.4f}")
-    print("\n   For context on the same 800 images:")
-    print("     B4 free       corr 0.9731  size 1.130  nmse 0.0527  peak 0.748")
-    print("     B4 +sersic    corr 0.9794  size 1.043  nmse 0.0408  peak 0.927")
+    print("\n   For context, measured earlier on the same dataset:")
+    print("     Option 2 linear inversion, 64^2 free px ... corr 0.958  nmse 0.082")
+    print("     B3 decoder (Sersic + 32^2 correction)  ... corr 0.959  nmse 0.080")
+    print("     original grid pipeline                 ... size_ratio 10.6-12.8")
 
+    print("\n2. IS THE FREE-FORM SOURCE WELL POSED?\n")
     fb = np.array([r["src_flux_in_box"] for r in rows], float)
+    print(f"   recovered flux / true flux:  p10 {np.percentile(fb,10):.3f}"
+          f"   median {np.median(fb):.3f}   p90 {np.percentile(fb,90):.3f}")
+    print("   A boxed source cannot hold flux outside its box; at "
+          f"half-extent {H} arcsec")
+    print("   the true source has ~89% of its flux inside, so ~0.9 is the ceiling,")
+    print("   not 1.0. Well below that means the network is losing flux; well")
+    print("   above means it is inventing it.")
     ch = np.array([r["chi2_per_dof"] for r in rows], float)
-    print("\n2. WELL-POSEDNESS\n")
-    print(f"   flux in box: p10 {np.percentile(fb,10):.3f}  median {np.median(fb):.3f}"
-          f"  p90 {np.percentile(fb,90):.3f}   (ceiling ~0.89 at H=1.2)")
-    chb = np.array([r["chi2_per_dof_bgonly"] for r in rows], float)
-    print(f"   {describe(a.poisson_gain, a.sigma_floor)}")
-    print(f"   chi2/dof            median {np.median(ch):.2f}"
-          f"   p10 {np.percentile(ch,10):.2f}   p90 {np.percentile(ch,90):.2f}")
-    print(f"   chi2/dof (bg-only)  median {np.median(chb):.0f}"
-          f"   p10 {np.percentile(chb,10):.0f}   p90 {np.percentile(chb,90):.0f}"
-          f"   <- the paper's convention")
-    print("   NOTE the gate-vs-control paired test is a RELATIVE comparison and")
-    print("   survives either convention, provided both sides use the same one.")
-    if gate_frac:
-        print(f"\n   mean gate value {np.mean(gate_frac):.3f}"
-              f"  -- the fraction of the source box where the full "
-              f"super-resolution is allowed through.")
-        print("   Near 1 means the gate is doing nothing (raise --mu-gate);")
-        print("   near 0 means it has switched the super-resolution off entirely.")
+    print(f"\n   chi2/dof (plain sigma, comparable with evaluate.py): "
+          f"median {np.median(ch):.0f}   p10 {np.percentile(ch,10):.0f}"
+          f"   p90 {np.percentile(ch,90):.0f}")
+    print(f"   inference {1000*t_all/max(len(rows),1):.1f} ms/image on {dev}")
+
+    print("\n3. STRATIFIED BY snr_max\n")
+    snr = np.array([r["snr_max"] for r in rows], float)
+    for key, L in (("nmse", st_b4), ("size_ratio", st_b4)):
+        v = np.array([x[key] for x in L], float)
+        line = "   ".join(
+            f"{lo:g}-{hi if hi < 1e8 else 'inf'}: {np.median(v[(snr>=lo)&(snr<hi)]):.4f}"
+            for lo, hi in ((0, 6), (6, 15), (15, 1e9)))
+        print(f"   {key:12s} {line}")
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    json.dump({"config": ta, "b4": {k: gm(st_b5, k) for k in st_b5[0]},
+    json.dump({"config": ta,
+               "b4": {k: gm(st_b4, k) for k in st_b4[0]},
                "parametric": {k: gm(st_par, k) for k in st_par[0]},
                "rows": rows}, open(a.out, "w"), indent=1)
     np.savez_compressed(a.out_npz, **examples)
     print(f"\n  wrote {a.out}\n  wrote {a.out_npz}")
-    print(f"  figures:  python superres/make_figures_b4.py --metrics {a.out} "
-          f"--npz {a.out_npz}")
+    print("  figures:  python superres/make_figures_b4.py")
 
 
 if __name__ == "__main__":

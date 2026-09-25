@@ -94,7 +94,6 @@ except Exception as exc:                                    # pragma: no cover
 
 from backproject import backproject, ray_shoot_batch, sample_source
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN, describe
 from raytrace import area_downsample, image_plane_grid, load_psf
 from sisr_net import SourceSISR
 from sources import SersicSource
@@ -204,20 +203,11 @@ def main():
     ap.add_argument("--lambda-l2", type=float, default=0.0,
                     help="mu-weighted L2 on the source (residual, if --base "
                          "sersic), as a fraction of chi^2")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="PHOTON NOISE: var += g * model. Model_A was generated "
-                         "with var = sigma_bg^2 + flux/t; noise_model.py measures "
-                         "g two independent ways. This is physics, not a knob. "
-                         "0 restores the background-only variance of the R/PS run.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="MODEL ERROR: var += (f*model)^2. Was 0.02, which is "
-                         "where the R/PS runs had it, and it was doing the "
-                         "photon term's job with the wrong power of flux "
-                         "(flux^2 instead of flux). Now that --poisson-gain "
-                         "models photon noise properly this defaults to 0, and "
-                         "anything it still buys is a measurement of residual "
-                         "misspecification rather than a tuning gain. Set both "
-                         "only if you mean two distinct effects.")
+    ap.add_argument("--sigma-floor", type=float, default=0.02,
+                    help="sigma_eff^2 = sigma_bg^2 + (f*model)^2. Do not set to "
+                         "0: the PSF wings are wrong at the 1-3%% level and that "
+                         "error scales with flux, so without the floor one image "
+                         "in a batch of 16 takes half the gradient.")
     ap.add_argument("--max-gain", type=float, default=3.07,
                     help="measured median tangential stretch")
     ap.add_argument("--seed", type=int, default=0)
@@ -284,13 +274,7 @@ def main():
           f"({4300/n_out**2:.2f}:1)  -- but they are produced by a SHARED "
           f"convolutional decoder, not solved for independently")
     print(f"base {a.base}   reg {a.reg_mode}   lambda_curv {a.lambda_curv} x chi2"
-          f"   lambda_l2 {a.lambda_l2} x chi2")
-    print(describe(a.poisson_gain, a.sigma_floor))
-    if a.poisson_gain <= 0:
-        print("  *** background-only variance: reproduces the R/PS run and is NOT")
-        print("  *** the noise Model_A was generated with. val chi2 below is then")
-        print("  *** on the old scale and not comparable with a corrected run.")
-    print()
+          f"   lambda_l2 {a.lambda_l2} x chi2   sigma_floor {a.sigma_floor}\n")
 
     def step(X, S, L, P, BG, train):
         X, S, L = X.to(dev), S.to(dev), L.to(dev)
@@ -322,17 +306,10 @@ def main():
         sky = F.conv2d(F.pad(sky, (pad,) * 4, mode="replicate"), psf[None, None])
         pred = area_downsample(sky, a.supersample)[:, 0] + BG.reshape(-1, 1, 1)
 
-        # Per-pixel variance. `pred.detach()` is deliberate and load-bearing:
-        # the weights must be constants of the step, or the network can lower
-        # chi^2 by shrinking the model to inflate its own denominator.
-        var = (S[:, None, None]) ** 2
-        if a.poisson_gain > 0 or a.sigma_floor > 0:
-            m = pred.detach().clamp_min(0.0)
-            if a.poisson_gain > 0:
-                var = var + a.poisson_gain * m            # photon noise (data)
-            if a.sigma_floor > 0:
-                var = var + (a.sigma_floor * m) ** 2      # model error (model)
-        sig = torch.sqrt(var.clamp_min(1e-24))
+        sig = S[:, None, None]
+        if a.sigma_floor > 0:
+            sig = torch.sqrt(sig ** 2 +
+                             (a.sigma_floor * pred.detach().clamp_min(0.0)) ** 2)
         chi2 = ((((pred - X) / sig)[:, mask]) ** 2).mean()
 
         rel = (S_map - (base_out if base_out is not None else 0.0)) / amp

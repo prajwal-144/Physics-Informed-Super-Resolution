@@ -23,33 +23,14 @@ Here the image is kept in native units and the model carries a free amplitude
 and a free background, so the affine freedom lives in the model where it can be
 fitted, not in the data where it corrupts the noise scale.
 
-NOISE ESTIMATE -- sigma() IS THE BACKGROUND TERM ONLY. READ THIS.
------------------------------------------------------------------
-`sigma()` returns the standard deviation of the background annulus
-r > `bg_radius_px`. Model_A ships `snr_max` but no noise map. The arcs sit at
-r < 30 px on a 127 px grid, so r > 50 px is source-free; measured this way the
-background sigma is ~0.032 in native units, and `image` vs `image_nss` differ
-there by ~sqrt(2) times that, confirming the two carry independent noise
-realisations and that the estimate is picking up real detector noise rather
-than residual signal.
-
-That makes it a correct estimate of the BACKGROUND, and an incomplete estimate
-of the NOISE. Model_A was generated with
-
-    var = sigma_bg^2 + flux / t
-
-so on the arcs -- where every constraint in this project lives -- the variance
-is dominated by the flux term, not by this number. On a bright arc pixel the two
-differ by 10^3 to 10^5. Do NOT use `sigma()` on its own as a chi^2 weight:
-
-    from noise_model import variance, POISSON_GAIN
-    var = variance(model, ds.sigma(i), gain=POISSON_GAIN)
-
-noise_model.py holds the measurement (two independent routes, both reproduced by
-verify_noise_model.py) and is the single definition every script now imports.
-`sigma()` itself is deliberately unchanged: it does one thing correctly, it is
-still what the network input scaling arcsinh(back-projection / sigma) needs, and
-every caller that wanted a likelihood weight has been updated instead.
+NOISE ESTIMATE
+--------------
+sigma is the standard deviation of the background annulus r > `bg_radius_px`.
+Model_A ships `snr_max` but no noise map. The arcs sit at r < 30 px on a 127 px
+grid, so r > 50 px is source-free; measured this way the background sigma is
+~0.032 in native units, and `image` vs `image_nss` differ there by ~sqrt(2)
+times that, confirming the two carry independent noise realisations and that the
+estimate is picking up real detector noise rather than residual signal.
 
 TRUTH IS FOR EVALUATION ONLY
 ----------------------------

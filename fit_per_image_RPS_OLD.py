@@ -84,7 +84,6 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from data_a import ModelADataset
-from noise_model import POISSON_GAIN, describe, variance
 from raytrace import gaussian_psf, image_plane_grid, load_psf, moffat_psf, render
 from sources import SersicSource, sersic_defaults
 from theta_e_init import initial_guess
@@ -154,8 +153,7 @@ def initial_vector(img: np.ndarray, pixel_scale: float) -> np.ndarray:
 def fit_one(img: np.ndarray, sigma: float, n_pix: int, pixel_scale: float,
             psf_fwhm: float = 0.18, supersample: int = 2,
             fit_radius_px: float = 45.0, grid=None, psf=None,
-            verbose: bool = False, poisson_gain: float = POISSON_GAIN,
-            sigma_floor: float = 0.0, reweight_passes: int = 2) -> Dict:
+            verbose: bool = False) -> Dict:
     """Fit one image. Returns the parameter dict, chi2/dof and diagnostics.
 
     `fit_radius_px` restricts the residual to a disc around the centre. The arcs
@@ -163,33 +161,6 @@ def fit_one(img: np.ndarray, sigma: float, n_pix: int, pixel_scale: float,
     of pure-noise pixels that dilute chi^2 without constraining anything. The
     background parameter is still constrained because the disc contains plenty of
     blank sky.
-
-    WEIGHTING -- CHANGED, AND WHY IT HAD TO BE
-    ------------------------------------------
-    This used to divide the residual by the scalar background sigma. Model_A was
-    generated with var = sigma_bg^2 + flux/t (noise_model.py measures the
-    coefficient two independent ways), so a scalar sigma understates the
-    variance on a bright arc pixel by 10^3 to 10^5 and the fit was effectively
-    determined by the few brightest pixels of each image. The weights now follow
-    the model:
-
-        var = sigma_bg^2 + poisson_gain*max(model,0) + (sigma_floor*model)^2
-
-    Because the variance depends on the model this is iteratively reweighted
-    least squares. The weights are FROZEN inside each call to least_squares and
-    recomputed from the converged model between stages, with `reweight_passes`
-    extra passes over the all-free stage so they converge rather than lagging a
-    stage behind. Freezing earns its place twice: it keeps each sub-problem an
-    honest weighted least squares for `trf` to solve, and it stops the optimiser
-    lowering chi^2 by shrinking the model to inflate its own error bars, which
-    is what a live model-dependent weight would reward.
-
-    Weights come from the MODEL, never from the data. Weighting by observed
-    counts is the standard Poisson-weighting bias and pulls faint pixels low.
-
-    `poisson_gain = 0` short-circuits to the original scalar path, bit for bit,
-    and skips the extra passes, so `--poisson-gain 0` reproduces the R/PS
-    submission fits exactly. Both conventions are reported on every row.
     """
     if grid is None:
         grid = image_plane_grid(n_pix, pixel_scale, supersample)
@@ -200,9 +171,7 @@ def fit_one(img: np.ndarray, sigma: float, n_pix: int, pixel_scale: float,
     yy, xx = np.indices((n_pix, n_pix))
     mask = np.hypot(yy - c, xx - c) <= fit_radius_px
     data = img[mask]
-    sig_bg = max(sigma, 1e-12)
-    inv_sig = 1.0 / sig_bg
-    weighted = poisson_gain > 0.0 or sigma_floor > 0.0
+    inv_sig = 1.0 / max(sigma, 1e-12)
 
     v0 = initial_vector(img, pixel_scale)
     lo = np.array([BOUNDS[k][0] for k in PARAMS])
@@ -217,31 +186,15 @@ def fit_one(img: np.ndarray, sigma: float, n_pix: int, pixel_scale: float,
         return render(SersicSource(src), lens, n_pix, pixel_scale, psf=psf,
                       supersample=supersample, grid=grid, background=bg)
 
-    def weights_from(pred_masked):
-        """1/sigma_eff on the fit disc, from a frozen reference model."""
-        if not weighted:
-            return np.full(data.shape, inv_sig)
-        var = variance(pred_masked, sig_bg, gain=poisson_gain, frac=sigma_floor)
-        return 1.0 / np.sqrt(np.clip(var, 1e-24, None))
-
     t0 = time.time()
     v = v0.copy()
-    # The neutral starting model is a poor variance reference, so open with the
-    # scalar weights and let the between-stage refresh take over as soon as
-    # there is a fitted model to compute them from.
-    w = np.full(data.shape, inv_sig)
-
-    schedule = list(STAGES)
-    if weighted and reweight_passes > 0:
-        schedule += [(f"reweight{k + 1}", PARAMS) for k in range(reweight_passes)]
-
-    for name, free in schedule:
+    for name, free in STAGES:
         idx = np.array([PARAMS.index(k) for k in free])
 
-        def resid(sub, _idx=idx, _v=v, _w=w):
-            u = _v.copy()
-            u[_idx] = sub
-            return (model(u)[mask] - data) * _w
+        def resid(sub, _idx=idx, _v=v):
+            w = _v.copy()
+            w[_idx] = sub
+            return (model(w)[mask] - data) * inv_sig
 
         try:
             r = least_squares(resid, v[idx], bounds=(lo[idx], hi[idx]),
@@ -254,26 +207,13 @@ def fit_one(img: np.ndarray, sigma: float, n_pix: int, pixel_scale: float,
             break
         if verbose:
             chi = float((r.fun ** 2).sum() / max(data.size - len(idx), 1))
-            print(f"    stage {name:10s} chi2/dof = {chi:8.3f}   nfev={r.nfev}")
-        if weighted:                        # refresh the frozen weights
-            w = weights_from(model(v)[mask])
+            print(f"    stage {name:9s} chi2/dof = {chi:8.3f}   nfev={r.nfev}")
 
     pred = model(v)
-    resid_m = pred[mask] - data
-
-    # chi2 on the corrected noise model (the number to quote) and on the old
-    # background-only convention (so rows stay comparable with the submission).
-    dof = max(data.size - len(PARAMS), 1)
-    w_fin = weights_from(pred[mask])
-    chi2 = float(((resid_m * w_fin) ** 2).sum() / dof)
-    chi2_bg = float(((resid_m * inv_sig) ** 2).sum() / dof)
-
+    chi2 = float((((pred[mask] - data) * inv_sig) ** 2).sum()
+                 / max(data.size - len(PARAMS), 1))
     out = dict(zip(PARAMS, [float(x) for x in v]))
-    out.update({"chi2_per_dof": chi2,
-                "chi2_per_dof_bgonly": chi2_bg,
-                "poisson_gain": float(poisson_gain),
-                "sigma_floor": float(sigma_floor),
-                "n_pixels": int(data.size),
+    out.update({"chi2_per_dof": chi2, "n_pixels": int(data.size),
                 "n_params": len(PARAMS), "seconds": time.time() - t0,
                 "n_model_evals": n_eval[0],
                 "e": float(np.hypot(out["e1"], out["e2"])),
@@ -309,21 +249,6 @@ def main():
                          "axion class rms(image - image_nss) inside r<30 px is 4.33 "
                          "against a background sigma of 0.032, so a smooth model can "
                          "NEVER reach chi2/dof ~ 1 against `image`.")
-    ap.add_argument("--poisson-gain", type=float, default=POISSON_GAIN,
-                    help="variance per unit flux: var = sigma_bg^2 + g*model. "
-                         "MEASURED, not a knob -- see noise_model.py, which gets "
-                         "0.75-0.9 from the band difference and from the stored "
-                         "snr_max independently. 0 restores the background-only "
-                         "convention of the R/PS submission, bit for bit.")
-    ap.add_argument("--sigma-floor", type=float, default=0.0,
-                    help="extra MULTIPLICATIVE term (f*model)^2 for model error. "
-                         "Separate quantity from --poisson-gain; do not tune the "
-                         "two against each other. Default 0 now that photon "
-                         "noise is modelled properly.")
-    ap.add_argument("--reweight-passes", type=int, default=2,
-                    help="extra all-free IRLS passes after the staged schedule, "
-                         "so the frozen variance weights converge. Ignored when "
-                         "--poisson-gain 0.")
     ap.add_argument("--out", default="sie_pipeline/results/fits_val_axion.json")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
@@ -341,13 +266,8 @@ def main():
             raise SystemExit("--psf-mode empirical requires --supersample 1 "
                              "(the stored kernel is on the detector grid)")
         psf = load_psf(a.psf_path)
-    print("grid %d px @ %s arcsec/px, supersample %d, PSF %s FWHM %.2f"
+    print("grid %d px @ %s arcsec/px, supersample %d, PSF %s FWHM %.2f\n"
           % (n_pix, a.pixel_scale, a.supersample, a.psf_mode, a.psf_fwhm))
-    print(describe(a.poisson_gain, a.sigma_floor))
-    if a.poisson_gain <= 0:
-        print("  *** background-only variance: this reproduces the R/PS run and")
-        print("  *** is NOT the noise Model_A was generated with.")
-    print()
 
     rows: List[Dict] = []
     t0 = time.time()
@@ -358,9 +278,7 @@ def main():
             print(f"[{i}] sigma={sig:.4f}")
         r = fit_one(img, sig, n_pix, a.pixel_scale, psf_fwhm=a.psf_fwhm,
                     supersample=a.supersample, fit_radius_px=a.fit_radius_px,
-                    grid=grid, psf=psf, verbose=a.verbose,
-                    poisson_gain=a.poisson_gain, sigma_floor=a.sigma_floor,
-                    reweight_passes=a.reweight_passes)
+                    grid=grid, psf=psf, verbose=a.verbose)
         r["index"] = i
         r["path"] = str(ds.paths[i])
         r["sigma"] = sig
@@ -370,9 +288,7 @@ def main():
             el = time.time() - t0
             print(f"  {i+1}/{len(ds)}   chi2/dof median "
                   f"{np.median([x['chi2_per_dof'] for x in rows]):.3f}   "
-                  f"(bg-only {np.median([x['chi2_per_dof_bgonly'] for x in rows]):.0f})"
-                  f"   {el/(i+1):.1f} s/image"
-                  f"   eta {el/(i+1)*(len(ds)-i-1)/60:.1f} min",
+                  f"{el/(i+1):.1f} s/image   eta {el/(i+1)*(len(ds)-i-1)/60:.1f} min",
                   flush=True)
 
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
